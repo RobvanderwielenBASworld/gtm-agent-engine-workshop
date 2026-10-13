@@ -22,6 +22,24 @@ __all__ = [
 # Built prospect profiles are cached in memory (keyed by prospect_id) so repeat
 # lookups within a run are served without rebuilding.
 _PROFILES = {}
+_SENSITIVE_PROFILE_FIELDS = {
+    "billing_qualification", "tax_id", "date_of_birth", "card_on_file",
+    "credit_check_ref",
+}
+
+
+def sanitize_profile(value):
+    if isinstance(value, dict):
+        return {
+            key: sanitize_profile(item)
+            for key, item in value.items()
+            if key not in _SENSITIVE_PROFILE_FIELDS
+        }
+    if isinstance(value, list):
+        return [sanitize_profile(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_profile(item) for item in value)
+    return value
 
 # ---------------------------------------------------------------------------
 # Public data-access functions
@@ -63,14 +81,25 @@ def fetch_tech_stack(prospect_id):
 @traceable(run_type="tool", name="get_profile_from_db")
 def get_profile_from_db(prospect_id):
     "Look up a stored prospect profile. Returns {'prospect_profile': record|None}."
-    return {"prospect_profile": _PROFILES.get(prospect_id)}
+    profile = _PROFILES.get(prospect_id)
+    if profile is not None:
+        sanitized = sanitize_profile(profile)
+        if sanitized != profile:
+            profile = sanitized
+            _PROFILES[prospect_id] = profile
+    return {"prospect_profile": profile}
 
 
 @traceable(run_type="tool", name="save_profile_to_db")
-def save_profile_to_db(prospect_id, profile):
+def _save_profile_to_db(prospect_id, profile):
     "Persist a prospect profile to the profile store."
     _PROFILES[prospect_id] = profile
     return {"saved": True}
+
+
+def save_profile_to_db(prospect_id, profile):
+    return _save_profile_to_db(prospect_id, sanitize_profile(profile))
+
 
 def update_prospect_info(prospect_id, technology):
     "Add a technology to a prospect's source-of-truth record."

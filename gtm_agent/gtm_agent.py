@@ -27,6 +27,7 @@ os.environ.setdefault("LANGSMITH_TRACING", "true")
 
 from pydantic import BaseModel
 from langchain.tools import tool, ToolRuntime
+from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
 
@@ -52,17 +53,21 @@ def build_prospect_profile(prospect_id: str) -> dict:
     "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
-        return {"prospect_profile": existing, "found": True}
+        profile = data_service.sanitize_profile(existing)
+        if profile != existing:
+            data_service.save_profile_to_db(prospect_id, profile)
+        return {"prospect_profile": profile, "found": True}
     rec = data_service.get_prospect_record(prospect_id)
     if rec is None:
         return {"prospect_profile": None, "found": False}
     built = {
         "prospect_id": prospect_id,
-        **rec,
+        **data_service.sanitize_profile(rec),
         "engagement_history": data_service.fetch_engagement_history(prospect_id),
         "account_details": data_service.fetch_account_details(prospect_id),
         "tech_stack": data_service.fetch_tech_stack(prospect_id),
     }
+    built = data_service.sanitize_profile(built)
     data_service.save_profile_to_db(prospect_id, built)
     return {"prospect_profile": built, "found": True}
 
@@ -102,18 +107,49 @@ def _offering_has_required_fields(offering):
         offering.get("min_annual_revenue") is not None and bool(offering.get("description"))
 
 
-@tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
+SCORING_PROFILE_FIELDS = (
+    "prospect_id", "name", "annual_revenue", "tech_stack", "account_details",
+    "engagement_history",
+)
+
+
+def _scoring_profile(prospect_profile):
+    return data_service.sanitize_profile({
+        key: prospect_profile[key] for key in SCORING_PROFILE_FIELDS
+        if key in prospect_profile
+    })
+
+
+def _sanitize_score_tool_input(tool_input):
+    if not isinstance(tool_input, dict):
+        return tool_input
+    if isinstance(tool_input.get("args"), dict):
+        return {
+            key: tool_input[key]
+            for key in ("type", "name", "id")
+            if key in tool_input
+        } | {"args": _sanitize_score_tool_input(tool_input["args"])}
+    sanitized = {}
+    if isinstance(tool_input.get("prospect_profile"), dict):
+        sanitized["prospect_profile"] = _scoring_profile(
+            tool_input["prospect_profile"]
+        )
+    if isinstance(tool_input.get("offering"), dict):
+        sanitized["offering"] = tool_input["offering"]
+    return sanitized
+
+
+def _score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
     "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
-    # Score against the prospect's saved tech stack of record.
-    pid = prospect_profile.get("prospect_id")
+    profile = _scoring_profile(prospect_profile)
+    pid = profile.get("prospect_id")
     if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+        profile["tech_stack"] = data_service.fetch_tech_stack(pid)
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
+        "\n\nProspect profile:\n" + json.dumps(profile, indent=2)
     )
     result = _scoring_llm.invoke([
         {"role": "system", "content": SCORING_PROMPT},
@@ -122,18 +158,41 @@ def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict
     return result.model_dump()
 
 
+class _SanitizedScoringTool(StructuredTool):
+    def invoke(self, input, config=None, **kwargs):
+        return super().invoke(_sanitize_score_tool_input(input), config, **kwargs)
+
+    async def ainvoke(self, input, config=None, **kwargs):
+        return await super().ainvoke(
+            _sanitize_score_tool_input(input), config, **kwargs
+        )
+
+    def run(self, tool_input, *args, **kwargs):
+        return super().run(_sanitize_score_tool_input(tool_input), *args, **kwargs)
+
+    async def arun(self, tool_input, *args, **kwargs):
+        return await super().arun(
+            _sanitize_score_tool_input(tool_input), *args, **kwargs
+        )
+
+
+score_prospect = _SanitizedScoringTool.from_function(
+    func=_score_prospect,
+    name="score_prospect",
+    description=_score_prospect.__doc__,
+)
+
+
 @tool
 def get_prospect(prospect_id: str) -> dict:
     "Look up a prospect's contact details by prospect_id (e.g. 'LEAD-12853'). Returns the prospect's name and email plus a found flag."
     record = data_service.get_prospect_record(prospect_id)
     if record is None:
         return {"prospect": None, "found": False}
-    # Carry the contact fields through, dropping the bulky enrichment blobs the
-    # caller can pull from build_prospect_profile instead.
     contact = {
         "prospect_id": prospect_id,
-        **{k: v for k, v in record.items()
-           if k not in ("engagement_history", "account_details", "tech_stack")},
+        "name": record.get("name"),
+        "email": record.get("email"),
     }
     return {"prospect": contact, "found": True}
 
